@@ -11,11 +11,12 @@ import open3d as o3d
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, Vector3
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Header
 from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
 
 # --- Video Depth Anything (stream) ---
 # 레포를 워크스페이스에 포함하거나 PYTHONPATH를 잡아주세요.
@@ -135,6 +136,7 @@ class VideoDepthAnythingStreamNode(Node):
         self.sub_img = self.create_subscription(Image, self.image_topic, self.on_image, 10)
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_camera_info, 10)
         self.pub_mesh = self.create_publisher(Marker, "vda/mesh_marker", 1)
+        self.pub_cloud = self.create_publisher(PointCloud2, "vda/pointcloud", 1)
 
         # 상태
         self.lock = threading.Lock()
@@ -161,6 +163,37 @@ class VideoDepthAnythingStreamNode(Node):
         with self.lock:
             self.latest_img_msg = msg
             self.latest_bgr = bgr
+
+    def _build_pointcloud_msg(self, pts, colors, header):
+        if pts.size == 0:
+            return None
+        points = np.asarray(pts, dtype=np.float32)
+
+        if colors is None:
+            cloud_msg = pc2.create_cloud_xyz32(header, points.tolist())
+            cloud_msg.is_dense = False
+            return cloud_msg
+
+        colors = np.clip(np.asarray(colors), 0.0, 1.0)
+        colors_uint8 = (colors * 255.0).astype(np.uint8)
+        rgb_uint32 = (
+            (colors_uint8[:, 0].astype(np.uint32) << 16)
+            | (colors_uint8[:, 1].astype(np.uint32) << 8)
+            | colors_uint8[:, 2].astype(np.uint32)
+        )
+        rgb_float32 = rgb_uint32.view(np.float32)
+        points_rgba = np.hstack((points, rgb_float32.reshape(-1, 1)))
+
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+
+        cloud_msg = pc2.create_cloud(header, fields, points_rgba.tolist())
+        cloud_msg.is_dense = False
+        return cloud_msg
 
     # --- Main processing (1 Hz) ---
     def process_tick(self):
@@ -200,6 +233,14 @@ class VideoDepthAnythingStreamNode(Node):
 
         # 4) Auto Projection (역투영 -> 포인트클라우드)
         pts, colors = depth_to_points(depth_m, fx, fy, cx, cy, stride=self.pcd_stride, rgb=rgb)
+
+        cloud_header = Header()
+        cloud_header.stamp = header.stamp
+        cloud_header.frame_id = self.frame_id
+
+        cloud_msg = self._build_pointcloud_msg(pts, colors, cloud_header)
+        if cloud_msg is not None:
+            self.pub_cloud.publish(cloud_msg)
 
         # 5) Open3D 포인트클라우드 & BPA 메시
         if pts.shape[0] < 100:  # 너무 적으면 스킵
